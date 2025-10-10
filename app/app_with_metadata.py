@@ -27,6 +27,7 @@ ARXIV_ID_COL = "arxiv_id"
 TOPK_INITIAL = 50
 TOPK_SHOW = 15
 
+
 # Models
 SPECTER2_MODEL = "allenai/specter2_base"
 SPECTER2_ADAPTER = "allenai/specter2"
