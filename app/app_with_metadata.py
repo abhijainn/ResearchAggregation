@@ -14,9 +14,9 @@ from adapters import AutoAdapterModel
 # -----------------------------
 # CONFIG — edit paths if needed
 # -----------------------------
-SPECTER2_PARQUET = "arxiv_specter2_embeddings.parquet"  # must have 'embedding','title','abstract'; optional 'filepath','url','arxiv_id'
-MXBAI_VECS_PATH = "mxbai_doc_vectors.npy"
-METADATA_CSV = "arxiv_metadata.csv"                     # optional; adds published/updated/doi/filename
+SPECTER2_PARQUET = "app/arxiv_specter2_embeddings.parquet"  # must have 'embedding','title','abstract'; optional 'filepath','url','arxiv_id'
+MXBAI_VECS_PATH = "app/mxbai_doc_vectors.npy"
+METADATA_CSV = "app/arxiv_metadata.csv"                     # optional; adds published/updated/doi/filename
 TITLE_COL = "title"
 ABSTR_COL = "abstract"
 EMBED_COL = "embedding"
@@ -236,7 +236,7 @@ if gen_llm:
     tok_llm, model_llm, model_llm_name = load_llm()
 
 # Load cached doc vectors
-MXBAI_VECS_PATH = "mxbai_doc_vectors.npy"
+MXBAI_VECS_PATH = "app/mxbai_doc_vectors.npy"
 mxbai_vecs = np.load(MXBAI_VECS_PATH, mmap_mode="r").astype(np.float32)
 
 # Handle query + search
