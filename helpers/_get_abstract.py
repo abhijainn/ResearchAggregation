@@ -8,12 +8,20 @@ Change model as needed.
 Notes: 
  - gpt-5-nano does not take temp and max tokens as parameters.
  - v1 on 10/12/2025: implemented basic functions
+ - v2 on 10/13/2025: added code to pull from config file, removed API key
 """
 
 # Imports
 import os
 from typing import Dict, List, Optional
 from openai import OpenAI
+
+from ._log import log
+
+try:
+    from app.config import CONFIG  # type: ignore
+except ImportError:
+    from config import CONFIG  # type: ignore
 
 try:
     from dotenv import load_dotenv, find_dotenv
@@ -22,24 +30,16 @@ except Exception:
     pass
 
 # Globals
-MODEL_NAME = "gpt-5-nano"
+MODEL_NAME = CONFIG.llm.model_name
+SYSTEM_PROMPT = CONFIG.prompts.abstract_system_prompt
+USER_PROMPT_TEMPLATE = CONFIG.prompts.abstract_user_prompt_template
 
 _client: Optional[OpenAI] = None
-
-SYSTEM_PROMPT = (
-    "You are a meticulous scientific writing assistant.\n"
-    "Write plausible research paper abstracts in 2-3 complete sentences.\n"
-    "Mirror the tone of peer-reviewed scientific literature, focusing on objectives, methodology, and key findings.\n"
-    "Align your response with the user's claim. Do not attempt to correct the user if their claim is wrong.\n"
-    "Avoid citations, hedging, and unnecessary background context.\n"
-    "Do not invent overly specific experimental details."
-)
-
 
 def _get_openai_client() -> OpenAI:
     global _client
     if _client is None:
-        api_key = os.getenv("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")
+        api_key = os.getenv("OPENAI_API_KEY")
         if api_key:
             _client = OpenAI(api_key=api_key)
         else:
@@ -47,7 +47,7 @@ def _get_openai_client() -> OpenAI:
                 _client = OpenAI()
             except Exception as e:
                 raise EnvironmentError(
-                    "OPENAI_API_KEY is not set. Create a .env file in your project root with 'OPENAI_API_KEY=sk-...' or export it in your shell before running."
+                    "OPENAI_API_KEY is not set. Create a .env file in your project root with 'OPENAI_API_KEY=...' or export it in your shell before running."
                 ) from e
     return _client
 
@@ -60,11 +60,7 @@ def _normalize_query(query: str) -> str:
 def _build_messages(query: str) -> List[Dict[str, List[Dict[str, str]]]]:
     normalized_query = _normalize_query(query)
 
-    user_prompt = (
-        f"User Claim:\n{normalized_query}\n\n"
-        "Write a 3-4 sentence abstract that aligns with the chosen stance."
-        "ABSTRACT: "
-    )
+    user_prompt = USER_PROMPT_TEMPLATE.format(claim=normalized_query)
 
     return [
         {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]},
@@ -93,6 +89,7 @@ def get_claim(query: str) -> str:
 __all__ = [
     "MODEL_NAME",
     "SYSTEM_PROMPT",
+    "USER_PROMPT_TEMPLATE",
     "get_claim",
 ]
 
