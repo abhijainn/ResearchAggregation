@@ -4,15 +4,22 @@ from typing import List, Dict, Optional
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+ 
+from ._log import log
+
+try:
+    from app.config import CONFIG  # type: ignore
+except ImportError:
+    from config import CONFIG  # type: ignore
 
 
-DEFAULT_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+DEFAULT_MODEL = CONFIG.rerank.cross_encoder_model
 
 
 @lru_cache(maxsize=2)
 def _load_model_and_tokenizer(model_name: str = DEFAULT_MODEL, device: Optional[str] = None):
     if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = CONFIG.runtime.device
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForSequenceClassification.from_pretrained(model_name)
     model.to(device)
@@ -62,6 +69,9 @@ def rerank_with_cross_encoder(
         return []
 
     model, tokenizer, device = _load_model_and_tokenizer(model_name, device)
+
+    logmsg = f"Loaded model and tokenizer to {device}"
+    log(logmsg)
 
     pairs = []
     for cand in candidates:
