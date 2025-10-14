@@ -13,6 +13,7 @@ except ImportError:
 
 # Helper Modules
 from helpers._get_abstract import *
+from helpers._LLM import *
 from helpers._cross_encoder_rerank import *
 from helpers._load_data import *
 from helpers._log import *
@@ -191,6 +192,11 @@ def render_result(rank: int, paper: Dict[str, Any]) -> None:
     if meta_lines:
         st.markdown("\n".join(meta_lines))
 
+    llm_summary = paper.get('llm_summary')
+    if llm_summary:
+        st.markdown("**LLM Summary**")
+        st.write(llm_summary)
+
     abstract = pick_first_non_empty(paper.get('abstract'), paper.get('summary'), paper.get('content'))
     st.markdown("**Abstract**")
     if abstract:
@@ -220,7 +226,7 @@ def main() -> None:
             value=top_k_default if top_k_default >= 1 else 5,
             step=1,
         )
-        col1, col2 = st.columns(2, gap="small")
+        col1, col2, col3 = st.columns(3, gap="small")
         with col1:
             use_hypothesis = st.checkbox(
                 "Search with hypothesis",
@@ -233,11 +239,19 @@ def main() -> None:
                 value=False,
                 help="When selected, rerank retrieved papers using the cross-encoder.",
             )
+        with col3:
+            generate_summaries = st.checkbox(
+                "Generate LLM summaries",
+                value=False,
+                help="When selected, summarize each result title with the LLM helper.",
+            )
         submitted = st.form_submit_button("Search")
 
     results: List[Dict[str, Any]] = []
     hypothesis_text: Optional[str] = None
     rerank_elapsed: Optional[float] = None
+    llm_summary_elapsed: Optional[float] = None
+    llm_summaries_generated = False
     query_text = query.strip()
 
     if submitted:
@@ -289,6 +303,31 @@ def main() -> None:
                 else:
                     results = rerank_results
 
+            if generate_summaries and results:
+                start = time.perf_counter()
+                llm_error: Optional[Exception] = None
+                with st.spinner("Generating LLM summaries..."):
+                    for paper in results:
+                        title_for_summary = pick_first_non_empty(
+                            paper.get('title'),
+                            paper.get('paper_title'),
+                            paper.get('name'),
+                            paper.get('content'),
+                        )
+                        if not title_for_summary:
+                            continue
+                        try:
+                            summary_text = summarize_title(title_for_summary)
+                        except Exception as exc:
+                            llm_error = exc
+                            break
+                        if summary_text:
+                            paper['llm_summary'] = summary_text
+                            llm_summaries_generated = True
+                llm_summary_elapsed = time.perf_counter() - start
+                if llm_error is not None:
+                    st.warning(f"LLM summarization stopped early: {llm_error}")
+
     if use_hypothesis and submitted:
         if hypothesis_text:
             st.text_area(
@@ -305,6 +344,16 @@ def main() -> None:
             st.metric("Rerank Duration (s)", f"{rerank_elapsed:.3f}")
         else:
             st.info("Rerank step skipped because no results were available.")
+
+    if generate_summaries and submitted:
+        if llm_summary_elapsed is not None:
+            st.metric("LLM Summary Duration (s)", f"{llm_summary_elapsed:.3f}")
+            if not llm_summaries_generated:
+                st.info("LLM summarization completed but did not return any summaries.")
+        elif results:
+            st.info("LLM summarization skipped because no valid titles were available.")
+        else:
+            st.info("LLM summarization skipped because no results were available.")
 
     if results:
         st.subheader(f"Top {len(results)} result{'s' if len(results) != 1 else ''}")
