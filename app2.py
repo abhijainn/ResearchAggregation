@@ -180,7 +180,8 @@ def render_result(rank: int, paper: Dict[str, Any]) -> None:
     url = pick_first_non_empty(paper.get('url'), paper.get('source_url'), paper.get('pdf_url'))
     vector_score = paper.get('vector_score')
 
-    st.markdown(f"#### {rank}. {title}")
+    clean_title = " ".join(str(title).splitlines()).strip()
+    st.markdown(f"#### {rank}. {clean_title}")
 
     meta_lines = []
     if authors:
@@ -255,6 +256,7 @@ def main() -> None:
 
     results: List[Dict[str, Any]] = []
     hypothesis_text: Optional[str] = None
+    hypothesis_elapsed: Optional[float] = None
     rerank_elapsed: Optional[float] = None
     llm_summary_elapsed: Optional[float] = None
     llm_summaries_generated = False
@@ -267,6 +269,7 @@ def main() -> None:
             fetch_k = max(top_k * 2, 20)
             hypothesis_generation_failed = False
             if use_hypothesis:
+                start = time.perf_counter()
                 with st.spinner("Generating abstract..."):
                     try:
                         hypothesis_text = get_claim(query_text)
@@ -274,6 +277,8 @@ def main() -> None:
                         st.warning(f"Abstract generation failed: {exc}")
                         hypothesis_text = None
                         hypothesis_generation_failed = True
+                    finally:
+                        hypothesis_elapsed = time.perf_counter() - start
 
             try:
                 with st.spinner("Searching the corpus..."):
@@ -323,7 +328,7 @@ def main() -> None:
                         if not title_for_summary:
                             continue
                         try:
-                            summary_text = summarize_title(title_for_summary)
+                            summary_text = cached_summarize_title(title_for_summary)
                         except Exception as exc:
                             llm_error = exc
                             break
@@ -334,7 +339,17 @@ def main() -> None:
                 if llm_error is not None:
                     st.warning(f"LLM summarization stopped early: {llm_error}")
 
+            if results:
+                if hypothesis_elapsed is not None:
+                    for paper in results:
+                        paper['abstract_generation_seconds'] = hypothesis_elapsed
+                if rerank_elapsed is not None:
+                    for paper in results:
+                        paper['rerank_seconds'] = rerank_elapsed
+
     if use_hypothesis and submitted:
+        if hypothesis_elapsed is not None:
+            st.metric("Abstract Generation Duration (s)", f"{hypothesis_elapsed:.3f}")
         if hypothesis_text:
             st.text_area(
                 "Generated Hypothesis",
@@ -364,26 +379,7 @@ def main() -> None:
     if results:
         st.subheader(f"Top {len(results)} result{'s' if len(results) != 1 else ''}")
         for rank, paper in enumerate(results, start=1):
-        # Render your existing metadata + abstract card
             render_result(rank, paper)
-
-            # NEW: auto-generate a short LLM summary from the title
-            if auto_title_tldr:
-                title = pick_first_non_empty(
-                    paper.get('title'),
-                    paper.get('paper_title'),
-                    paper.get('name'),
-                    paper.get('content'),
-                ) or f"Result {rank}"
-
-                with st.spinner(f"Summarizing title #{rank}…"):
-                    summary = cached_summarize_title(title)
-
-                st.markdown("**LLM Summary (from title)**")
-                if summary:
-                    st.write(summary)
-                else:
-                    st.caption("No summary generated (empty title or API error).")
 
         st.divider()
     elif submitted and query_text:
