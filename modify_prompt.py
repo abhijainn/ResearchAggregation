@@ -39,7 +39,7 @@ SYSTEM_PROMPT = (
 def _get_openai_client() -> OpenAI:
     global _client
     if _client is None:
-        api_key = os.getenv("OPENAI_API_KEY")
+        api_key = os.getenv("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")
         if api_key:
             _client = OpenAI(api_key=api_key)
         else:
