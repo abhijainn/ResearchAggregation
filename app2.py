@@ -8,9 +8,15 @@ import torch.nn.functional as F
 from adapters import AutoAdapterModel
 from langchain_community.vectorstores import FAISS
 from transformers import AutoTokenizer
+from openai import OpenAI
+import os
+
+
 
 # Helper Modules
 from modify_prompt import *
+from llm_summary import summarize_title
+
 from cross_encoder_rerank import rerank_with_cross_encoder
 
 try:
@@ -209,6 +215,10 @@ def semantic_search(
         results.append(doc_info)
     return results[:top_k], hypothesis
 
+@st.cache_data(show_spinner=False)
+def cached_summarize_title(title: str) -> Optional[str]:
+    return summarize_title(title)
+
 
 def _format_single_author(author: Any) -> Optional[str]:
     if not author:
@@ -318,6 +328,8 @@ def render_result(rank: int, paper: Dict[str, Any]) -> None:
     st.divider()
 
 
+
+
 def main() -> None:
     st.set_page_config(page_title="Research Aggregation Search", layout="wide")
     st.title("Research Aggregation Search")
@@ -341,6 +353,11 @@ def main() -> None:
             "Enable cross-encoder reranking",
             value=False,
             help="When enabled, rerank a larger set of retrieved candidates using a cross-encoder (slower but more accurate).",
+        )
+        auto_title_tldr = st.checkbox(
+        "Auto-generate LLM summary (from title) for each result",
+        value=True,
+        help="For each retrieved paper, call the LLM once to summarize the title.",
         )
 
         if not use_rerank:
@@ -445,7 +462,28 @@ def main() -> None:
     if results:
         st.subheader(f"Top {len(results)} result{'s' if len(results) != 1 else ''}")
         for rank, paper in enumerate(results, start=1):
+        # Render your existing metadata + abstract card
             render_result(rank, paper)
+
+            # NEW: auto-generate a short LLM summary from the title
+            if auto_title_tldr:
+                title = pick_first_non_empty(
+                    paper.get('title'),
+                    paper.get('paper_title'),
+                    paper.get('name'),
+                    paper.get('content'),
+                ) or f"Result {rank}"
+
+                with st.spinner(f"Summarizing title #{rank}…"):
+                    summary = cached_summarize_title(title)
+
+                st.markdown("**LLM Summary (from title)**")
+                if summary:
+                    st.write(summary)
+                else:
+                    st.caption("No summary generated (empty title or API error).")
+
+        st.divider()
     elif submitted and query_text:
         st.info("No results found. Try broadening the query or lowering the top_k value.")
     elif not submitted:
