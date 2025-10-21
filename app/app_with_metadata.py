@@ -14,7 +14,7 @@ from adapters import AutoAdapterModel
 # -----------------------------
 # CONFIG — edit paths if needed
 # -----------------------------
-SPECTER2_PARQUET = "app/arxiv_specter2_embeddings.parquet"  # must have 'embedding','title','abstract'; optional 'filepath','url','arxiv_id'
+SPECTER2_PARQUET = "app/arxiv_cs_only.jsonl"  # must have 'embedding','title','abstract'; optional 'filepath','url','arxiv_id'
 MXBAI_VECS_PATH = "app/mxbai_doc_vectors.npy"
 METADATA_CSV = "app/arxiv_metadata.csv"                     # optional; adds published/updated/doi/filename
 TITLE_COL = "title"
