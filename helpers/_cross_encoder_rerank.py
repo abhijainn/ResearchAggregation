@@ -4,6 +4,12 @@ from typing import List, Dict, Optional
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+from helpers._metadata_extractor import (
+    lookup_metadata,
+    lookup_metadata_by_title,
+)
+from helpers._arxiv_text_extractor import extract_text_from_arxiv
  
 from ._log import log
 
@@ -49,6 +55,37 @@ def _score_batch(model, tokenizer, device, pairs: List[tuple], batch_size: int =
             scores.extend(batch_scores)
     return scores
 
+def _get_full_text_for_candidate(cand):
+    """
+    Attempt to replace candidate content with real full_text.
+    Falls back to abstract-like fields if no full_text is available.
+    """
+
+    title = cand.get("paper_title") or cand.get("title") or ""
+    meta = lookup_metadata_by_title(title)
+
+    if not meta:
+        # metadata missing — fallback to abstract
+        return cand.get("content") or cand.get("summary") or cand.get("abstract") or title
+
+    # Try full_text from metadata
+    full = meta.get("full_text")
+    if isinstance(full, str) and full.strip():
+        return full
+
+    # If no full_text, attempt arXiv extraction
+    if meta.get("source") == "arxiv":
+        arxiv_id = meta.get("source_id_clean")
+        if isinstance(arxiv_id, str) and arxiv_id.strip():
+            try:
+                text = extract_text_from_arxiv(arxiv_id)
+                return text
+            except Exception as e:
+                print(f"Failed arXiv extraction for {arxiv_id}: {e}")
+
+    # fallback
+    return cand.get("content") or cand.get("summary") or cand.get("abstract") or title
+
 
 def rerank_with_cross_encoder(
     query: str,
@@ -75,25 +112,5 @@ def rerank_with_cross_encoder(
 
     pairs = []
     for cand in candidates:
-        title = (cand.get('title') or '').strip()
-        abstract = (cand.get('abstract') or cand.get('summary') or cand.get('content') or '').strip()
-        text = title
-        if title and abstract:
-            text = f"{title} [SEP] {abstract}"
-        elif abstract:
-            text = abstract
+        text = _get_full_text_for_candidate(cand)
         pairs.append((query, text))
-
-    scores = _score_batch(model, tokenizer, device, pairs, batch_size=batch_size)
-
-    for cand, score in zip(candidates, scores):
-        try:
-            cand['cross_score'] = float(score)
-        except Exception:
-            cand['cross_score'] = None
-
-    candidates_sorted = sorted(candidates, key=lambda d: (d.get('cross_score') is not None, d.get('cross_score')), reverse=True)
-
-    if top_k is not None:
-        return candidates_sorted[:top_k]
-    return candidates_sorted

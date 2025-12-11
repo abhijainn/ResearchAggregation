@@ -8,7 +8,11 @@ import time
 from QuerySpec import analyze_query_llm, simple_post_filter, QuerySpec
 
 import streamlit as st
-from langchain_community.vectorstores import FAISS
+import numpy as np
+import pandas as pd
+from numpy.linalg import norm
+
+import pyarrow.parquet as pq
 
 from helpers import *
 
@@ -24,6 +28,9 @@ from helpers._cross_encoder_rerank import *
 from helpers._load_data import *
 from helpers._log import *
 
+from app.decompose import decompose_query
+
+import pandas as pd
 
 # -----------------------------
 # CONFIG — edit paths if needed
@@ -35,7 +42,6 @@ DATA_DIR = CONFIG.paths.data_dir
 INDEX_NAME = CONFIG.faiss.index_name
 EMBED_MODEL_NAME = CONFIG.vector.embed_model_name
 
-
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -46,20 +52,114 @@ def get_embedder(model_name: str = EMBED_MODEL_NAME) -> Specter2Embeddings:
 
 
 @lru_cache(maxsize=1)
-def load_vectorstore() -> FAISS:
-    index_path = os.path.join(DATA_DIR, f"{INDEX_NAME}.faiss")
-    store_path = os.path.join(DATA_DIR, f"{INDEX_NAME}.pkl")
-    if not (os.path.exists(index_path) and os.path.exists(store_path)):
-        raise FileNotFoundError('Run the database creation step first.')
+def load_embedding_corpus():
+    """
+    Loads embeddings + IDs from the merged Parquet file instead of .npy/.csv.
 
-    embedder = get_embedder()
-    log("Loaded vectorstore")
-    return FAISS.load_local(
-        DATA_DIR,
-        embedder,
-        index_name=INDEX_NAME,
-        allow_dangerous_deserialization=True,
+    Uses:
+      - specter2_embeddings_all.parquet  (merged batch files)
+      - enhanced_final_meta_dataset_with_arxiv_deduped.csv
+
+    Returns:
+      embeddings: np.ndarray of shape [N, D]
+      merged: pd.DataFrame with enriched metadata aligned to embedding rows
+    """
+
+    parquet_path = r"C:\Users\sophi\Documents\research\FDL research\ResearchAggregation\data2\specter2_embeddings_all.parquet"
+    enhanced_path = r"C:\Users\sophi\Documents\research\FDL research\ResearchAggregation\data2\enhanced_final_meta_dataset_with_arxiv_deduped.csv"
+
+    if not os.path.exists(parquet_path):
+        raise FileNotFoundError(f"Missing merged parquet file: {parquet_path}")
+    if not os.path.exists(enhanced_path):
+        raise FileNotFoundError(f"Missing enhanced metadata CSV: {enhanced_path}")
+
+    # ====================================================
+    # 1. Load Parquet (embeddings + IDs)
+    # ====================================================
+    table = pq.read_table(parquet_path)
+
+    # Convert to pandas for easier merging logic
+    df_emb = table.to_pandas()
+
+    # Normalize ID column to string
+    if "source_id_clean" not in df_emb.columns:
+        raise KeyError("Column 'source_id_clean' missing from parquet file")
+
+    df_emb["source_id_clean"] = df_emb["source_id_clean"].astype(str).str.strip()
+
+    # Extract embeddings as a numpy array
+    # Each row is a list<float>, so convert manually
+    embeddings = np.vstack(df_emb["embedding"].apply(lambda x: np.array(x, dtype=np.float32)))
+
+    # ====================================================
+    # 2. Load enhanced metadata
+    # ====================================================
+    enhanced = pd.read_csv(enhanced_path)
+
+    # Normalize ID formats
+    enhanced["source_id_clean"] = enhanced["source_id_clean"].astype(str).str.strip()
+
+    # Debug intersections
+    set_emb = set(df_emb["source_id_clean"])
+    set_enh = set(enhanced["source_id_clean"])
+
+    print("Embedding IDs:", len(set_emb))
+    print("Enhanced IDs:", len(set_enh))
+    print("Intersection:", len(set_emb & set_enh))
+    print("Example overlap:", list(set_emb & set_enh)[:10])
+
+    missing_in_enh = set_emb - set_enh
+    missing_in_emb = set_enh - set_emb
+    print("Missing in enhanced:", len(missing_in_enh))
+    print("Missing in embeddings:", len(missing_in_emb))
+
+    # ====================================================
+    # 3. Merge by source_id_clean
+    # Keeps embedding order because we merge df_emb → enhanced
+    # ====================================================
+    merged = df_emb.merge(
+        enhanced,
+        on="source_id_clean",
+        how="left",
+        suffixes=("", "_enh"),
     )
+
+    # ====================================================
+    # 4. Fill missing metadata fields
+    # ====================================================
+    def _fill_missing(target_col, source_col):
+        if target_col not in merged.columns or source_col not in merged.columns:
+            return
+        mask = merged[target_col].isna() | merged[target_col].astype(str).str.strip().eq("")
+        merged.loc[mask, target_col] = merged.loc[mask, source_col]
+
+    _fill_missing("paper_title", "paper_title_enh")
+    _fill_missing("authors", "authors_enh")
+
+    # Other enhanced-only fields are already present under their names.
+
+    return embeddings, merged
+
+def build_results_from_metadata(df: pd.DataFrame) -> list[dict]:
+    results = []
+    for i, row in df.iterrows():
+        entry = {
+            "paper_title": row.get("paper_title"),
+            "authors": row.get("authors"),
+            "abstract": row.get("abstract"),
+            "full_text": row.get("full_text"),
+            "categories": row.get("categories"),
+            "doi": row.get("doi"),
+            "journal": row.get("journal"),
+            "date": row.get("date"),
+            "content": row.get("text"),
+            "source_id": row.get("source_id_clean"),
+            "vector_score": None,
+            "row_index": row.get("row_index"),
+        }
+        results.append(entry)
+    return results
+
 
 def semantic_search(
     query: str,
@@ -68,19 +168,45 @@ def semantic_search(
     *,
     use_hypothesis: bool = False,
     precomputed_hypothesis: Optional[str] = None,
+    restrict_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[List[Dict], Optional[str]]:
-    vectorstore = load_vectorstore()
+    """
+    Semantic search using:
+      - specter2_embeddings_acl.npy  (NumPy array, shape [N, D])
+      - specter2_id_map_acl.csv      (row_index, source_id, paper_title, authors, text)
+      - enriched metadata from enhanced_final_meta_dataset_with_arxiv_deduped.csv
+    """
+
+    # Load embedding matrix + pandas mapping (enriched)
+    embeddings, mapping = load_embedding_corpus()
+
+    if restrict_df is not None:
+        # Keep only rows whose source_id_clean appear in the restricted set
+        restrict_ids = set(str(x).strip() for x in restrict_df["source_id"])
+        mask = mapping["source_id"].astype(str).str.strip().isin(restrict_ids)
+
+        # Filter embeddings and mapping together
+        embeddings = embeddings[mask.values]
+        mapping = mapping[mask.values]
+
+    embedder = get_embedder()
+
     fetch = fetch_k or max(top_k, 20)
     fetch = max(fetch, top_k)
 
+    # ----------------------------------------
+    # Hypothesis generation handling
+    # ----------------------------------------
     search_text = query
     hypothesis: Optional[str] = None
     candidate_hypothesis: Optional[str] = precomputed_hypothesis
+
     if candidate_hypothesis is None and use_hypothesis:
         try:
             candidate_hypothesis = get_claim(query)
         except Exception as exc:
             raise RuntimeError(f"Failed to generate hypothesis: {exc}") from exc
+
     if isinstance(candidate_hypothesis, str):
         stripped = candidate_hypothesis.strip()
         if stripped:
@@ -91,15 +217,44 @@ def semantic_search(
     else:
         hypothesis = None
 
-    docs_with_scores = vectorstore.similarity_search_with_score(search_text, k=fetch)
+    # ----------------------------------------
+    # Encode the query using SPECTER2
+    # ----------------------------------------
+    q = embedder.embed_query(search_text)       # shape [D]
+    q = q / (np.linalg.norm(q) + 1e-12)
 
-    results = []
-    for doc, score in docs_with_scores:
-        doc_info = dict(doc.metadata)
-        doc_info.setdefault('content', doc.page_content)
-        doc_info['vector_score'] = float(score)
-        results.append(doc_info)
-    return results[:top_k], hypothesis
+    # Normalize embeddings for cosine similarity
+    E = embeddings
+    E = E / (np.linalg.norm(E, axis=1, keepdims=True) + 1e-12)
+
+    # Compute cosine similarity
+    sims = E @ q  # shape [N]
+
+    # Select top fetch candidates
+    idx = np.argpartition(sims, -fetch)[-fetch:]
+    idx = idx[np.argsort(sims[idx])[::-1]]
+    idx = idx[:top_k]
+
+    # ----------------------------------------
+    # Build results (enriched) in the SAME general format as before
+    # ----------------------------------------
+    results: List[Dict[str, Any]] = []
+    for i in idx:
+        row = mapping.iloc[i]
+
+        base_entry: Dict[str, Any] = {
+            "paper_title": row.get("paper_title"),
+            "authors": row.get("authors"),
+            "date": row.get("date"),
+            "content": row.get("text") or row.get("abstract"),
+            "source_id": row.get("source_id"),
+            "vector_score": float(sims[i]) if sims is not None else None,
+        }
+
+        results.append(base_entry)
+
+    return results, hypothesis
+
 
 @st.cache_data(show_spinner=False)
 def cached_summarize_title(title: str) -> Optional[str]:
@@ -123,14 +278,61 @@ def _format_single_author(author: Any) -> Optional[str]:
     return str(author)
 
 
+def _format_single_author(author: Any) -> Optional[str]:
+    if not author:
+        return None
+    if isinstance(author, str):
+        stripped = author.strip()
+        return stripped or None
+    if isinstance(author, dict):
+        for key in ('name', 'full_name'):
+            value = author.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        parts = [author.get('first'), author.get('middle'), author.get('last'), author.get('suffix')]
+        joined = ' '.join(part for part in parts if isinstance(part, str) and part.strip())
+        return joined or None
+    return str(author)
+
+
 def format_authors(authors: Any) -> Optional[str]:
     if not authors:
         return None
+
+    # -----------------------------------------
+    # NEW: semicolon-delimited authors
+    # -----------------------------------------
+    if isinstance(authors, str) and ";" in authors:
+        split_authors = [a.strip() for a in authors.split(";") if a.strip()]
+        if not split_authors:
+            return None
+        return ", ".join(split_authors)
+
+    # -----------------------------------------
+    # EXISTING logic for list / tuple / set
+    # -----------------------------------------
     if isinstance(authors, (list, tuple, set)):
         names = [_format_single_author(item) for item in authors]
         names = [name for name in names if name]
         return ', '.join(names) if names else None
+
+    # Fallback for other str or object types
     return _format_single_author(authors)
+
+def truncate_authors_list(author_string: str, limit: int = 5) -> Tuple[str, Optional[str]]:
+    """
+    Splits the author string into a list, truncates to `limit` authors,
+    and returns (display_string, full_string_if_truncated).
+
+    If not truncated, second return value is None.
+    """
+    authors = [a.strip() for a in author_string.split(",") if a.strip()]
+    if len(authors) <= limit:
+        return ", ".join(authors), None
+
+    truncated = ", ".join(authors[:limit])
+    full = ", ".join(authors)
+    return truncated + " ...", full
 
 
 def format_date(value: Any) -> Optional[str]:
@@ -187,11 +389,24 @@ def render_result(rank: int, paper: Dict[str, Any]) -> None:
     vector_score = paper.get('vector_score')
 
     clean_title = " ".join(str(title).splitlines()).strip()
+
     st.markdown(f"#### {rank}. {clean_title}")
 
     meta_lines = []
+    
     if authors:
-        meta_lines.append(f"- **Authors:** {authors}")
+        truncated, full_list = truncate_authors_list(authors, limit=5)
+
+        if full_list is None:
+            # No truncation needed — display normally
+            meta_lines.append(f"- **Authors:** {truncated}")
+        else:
+            # Truncated — show short version, plus a Streamlit expander
+            meta_lines.append(f"- **Authors:** {truncated}")
+
+            with st.expander("Show full author list"):
+                st.write(full_list)
+
     if published:
         meta_lines.append(f"- **Date:** {published}")
     if arxiv_id:
@@ -217,20 +432,136 @@ def render_result(rank: int, paper: Dict[str, Any]) -> None:
     st.divider()
 
 
+def metadata_filter_enhanced(results: List[Dict[str, Any]], spec: QuerySpec) -> List[Dict[str, Any]]:
+    """
+    Apply metadata filters with special handling for date and journal:
+
+      - If a date range is specified (via year_min/year_max), drop papers whose known
+        dates fall outside the range. If a paper has no valid date, keep it (treat as
+        unknown / "all the same" when no valid dates).
+      - For journal/venue filters, require a match only when journal is known.
+        Papers with missing journal are kept.
+
+    Other filters (if any) can still be applied by simple_post_filter before/after,
+    """
+    filtered = list(results)
+
+    # Extract potential numeric year filters from spec.metadata_filters
+    year_min = None
+    year_max = None
+    requested_journal = None
+
+    if getattr(spec, "metadata_filters", None):
+        mf = spec.metadata_filters
+        year_min = mf.get("year_min")
+        year_max = mf.get("year_max")
+        # 'venue' is a common key used for journal-like filtering
+        requested_journal = mf.get("venue") or mf.get("journal")
+
+    # --------------------------
+    # Date Filtering (by year)
+    # --------------------------
+    if year_min is not None or year_max is not None:
+        tmp: List[Dict[str, Any]] = []
+        for r in filtered:
+            date_val = r.get("date")
+
+            # If we have no date, keep the paper (unknown date treated as "all the same")
+            if date_val is None or (isinstance(date_val, float) and pd.isna(date_val)):
+                tmp.append(r)
+                continue
+
+            # date can be "YYYY", "YYYY-MM", "YYYY-MM-DD"
+            try:
+                year_str = str(date_val).split("-")[0]
+                year = int(year_str)
+            except Exception:
+                # Unparseable date → treat as unknown, keep it
+                tmp.append(r)
+                continue
+
+            if year_min is not None and year < year_min:
+                continue
+            if year_max is not None and year > year_max:
+                continue
+            tmp.append(r)
+
+        filtered = tmp
+
+    # --------------------------
+    # Journal / Venue Filtering
+    # --------------------------
+    if requested_journal:
+        tmp = []
+        req = str(requested_journal).lower().strip()
+        for r in filtered:
+            journal = r.get("journal")
+            if journal is None or (isinstance(journal, float) and pd.isna(journal)):
+                # Missing journal → keep (do not penalize unknowns)
+                tmp.append(r)
+                continue
+
+            journal_str = str(journal).lower()
+            if req in journal_str:
+                tmp.append(r)
+                continue
+
+            # If no match, drop
+        filtered = tmp
+
+    return filtered
 
 
 def main() -> None:
     st.set_page_config(page_title="Research Paper Recommender", layout="wide")
-    st.title("Research Aggregation Search")
-    st.caption("Run semantic retrieval over the local arXiv corpus with SPECTER2 embeddings.")
 
-    with st.form("search_form"):
-        query = st.text_area(
-            "Query",
-            value="",
-            placeholder="e.g. Retrieval-augmented generation for biomedical question answering",
-            height=120,
+    st.title("Research Aggregation Search")
+    st.caption("Run semantic retrieval over the local arXiv corpus with specter embeddings.")
+
+    # -------------------------------
+    # Two-column layout
+    # -------------------------------
+    left_col, right_col = st.columns([2, 3])
+
+    # -------------------------------
+    # CHAT WINDOW IN LEFT COLUMN
+    # -------------------------------
+    with left_col:
+        
+        st.markdown(
+            """
+            <style>
+            .chat-box {
+                height: 45vh;              /* fixed height */
+                overflow-y: auto;          /* scroll inside */
+                padding-right: 10px;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
         )
+
+        # Chat scroll container
+        st.markdown("<div class='chat-box'>", unsafe_allow_html=True)
+        chat_container = st.container()    # <-- this is the same container you use later
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        # Input box (static)
+        with st.form("chat_input_form", clear_on_submit=True):
+            user_query = st.text_area(
+                "",
+                height=90,
+                placeholder="Ask a research question...",
+                label_visibility="collapsed",
+            )
+            send = st.form_submit_button("Send")
+
+    # -------------------------------
+    # SIDEBAR SETTINGS
+    # -------------------------------
+    with st.sidebar:
+        st.header("Search Options")
+
         top_k_default = min(TOPK_SHOW, TOPK_INITIAL)
         top_k = st.slider(
             "Number of results (top_k)",
@@ -239,503 +570,183 @@ def main() -> None:
             value=top_k_default if top_k_default >= 1 else 5,
             step=1,
         )
-        col1, col2, col3 = st.columns(3, gap="small")
-        with col1:
-            use_hypothesis = st.checkbox(
-                "Search with hypothesis",
-                value=False,
-                help="When selected, generate a hypothesis from your query and use it for retrieval.",
-            )
-        with col2:
-            apply_rerank = st.checkbox(
-                "Enable cross-encoder reranking",
-                value=False,
-                help="When selected, rerank retrieved papers using the cross-encoder.",
-            )
-        with col3:
-            generate_summaries = st.checkbox(
-                "Generate LLM summaries",
-                value=False,
-                help="When selected, summarize each result title with the LLM helper.",
-            )
+        use_hypothesis = st.checkbox("Search with hypothesis", value=False)
+        apply_rerank = st.checkbox("Enable cross-encoder reranking", value=False)
+        generate_summaries = st.checkbox("Generate LLM summaries", value=False)
+        use_llm_analyzer = st.checkbox("Use LLM query analyzer", value=True)
 
-        use_llm_analyzer = st.checkbox(
-        "Use LLM query analyzer",
-        value=True,
-        help="Parse intent/filters via LLM and pass semantic text to retrieval.",
-            )
-        submitted = st.form_submit_button("Search")
-
-    results: List[Dict[str, Any]] = []
-    hypothesis_text: Optional[str] = None
-    hypothesis_elapsed: Optional[float] = None
-    rerank_elapsed: Optional[float] = None
-    llm_summary_elapsed: Optional[float] = None
+    # -------------------------------
+    # STATE
+    # -------------------------------
+    results = []
+    hypothesis_text = None
+    hypothesis_elapsed = None
+    rerank_elapsed = None
+    llm_summary_elapsed = None
     llm_summaries_generated = False
-    query_text = query.strip()
 
-    if submitted:
-        if not query_text:
-            st.warning("Please enter a query before searching.")
-        else:
-            fetch_k = max(top_k * 2, 20)
-            hypothesis_generation_failed = False
-                  # ASTA Style query analyzer
-            spec = None
-            semantic_text = query_text  
-            keyword_text = query_text   
-            try:
-                spec = analyze_query_llm(query_text)  # uses your OpenAI key
-                if spec and spec.semantic_query:
-                    semantic_text = spec.semantic_query
-                if spec and spec.keyword_query:
-                    keyword_text = spec.keyword_query
-            except Exception as exc:
-                # If analyzer not wired yet or fails, we keep using raw query_text
-                st.info(f"Query analyzer unavailable; using raw query. ({exc})")
-        # ---------------------------------------------
-            if use_hypothesis:
-                start = time.perf_counter()
-                with st.spinner("Generating abstract..."):
-                    try:
-                        hypothesis_text = get_claim(query_text)
-                    except Exception as exc:
-                        st.warning(f"Abstract generation failed: {exc}")
-                        hypothesis_text = None
-                        hypothesis_generation_failed = True
-                    finally:
-                        hypothesis_elapsed = time.perf_counter() - start
+    query_text = user_query.strip()
 
-            try:
-                with st.spinner("Searching the corpus..."):
-                     # ---------- CHANGED: use semantic_text here ----------
-                    results, hypothesis_text = semantic_search(
+    # -------------------------------
+    # HANDLE SEND
+    # -------------------------------
+    if send and query_text:
+
+        # ----------------------------------------
+        # (NEW) Metadata-Aware Decomposition
+        # ----------------------------------------
+        fields, metadata_matches = decompose_query(query_text)
+
+        only_metadata = (
+            metadata_matches is not None
+            and len(metadata_matches) > 0
+            and not fields.content.content  # empty content = pure metadata query
+        )
+
+        if only_metadata:
+            # Fast-path: Return metadata matches (NO semantic search)
+            results = build_results_from_metadata(metadata_matches)
+
+            with left_col:
+                with chat_container:
+                    st.markdown(
+                        f"""
+                        <div style='background:#1e1e1e;padding:10px;border-radius:8px;margin-bottom:10px;'>
+                            <b>System:</b> Found {len(results)} metadata match(es) — skipping semantic search.
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+            with right_col:
+                st.subheader("Search Results (Metadata Match)")
+                for rank, paper in enumerate(results, start=1):
+                    render_result(rank, paper)
+
+            return  # STOP HERE
+
+
+        with left_col:
+            with chat_container:
+                st.markdown(
+                    f"""
+                    <div style='background:#303030;padding:10px;border-radius:8px;margin-bottom:10px;'>
+                        <b>You:</b> {query_text}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+        # -------------------------------
+        # ANALYZER, SEARCH, RERANK, SUMMARIES
+        # -------------------------------
+        fetch_k = max(top_k * 2, 20)
+        hypothesis_generation_failed = False
+        spec = None
+        semantic_text = query_text
+        keyword_text = query_text
+
+        # Analyzer
+        try:
+            spec = analyze_query_llm(query_text)
+            if spec and spec.semantic_query:
+                semantic_text = spec.semantic_query
+            if spec and spec.keyword_query:
+                keyword_text = spec.keyword_query
+        except:
+            pass
+
+        # Hypothesis
+        if use_hypothesis:
+            start = time.perf_counter()
+            with st.spinner("Generating hypothesis..."):
+                try:
+                    hypothesis_text = get_claim(query_text)
+                except Exception:
+                    hypothesis_text = None
+                    hypothesis_generation_failed = True
+                finally:
+                    hypothesis_elapsed = time.perf_counter() - start
+
+        # Search
+        try:
+            with st.spinner("Searching the corpus..."):
+                results, hypothesis_text = semantic_search(
                     semantic_text,
                     top_k=top_k,
                     fetch_k=fetch_k,
                     use_hypothesis=use_hypothesis and not hypothesis_generation_failed,
                     precomputed_hypothesis=hypothesis_text,
                 )
-                # ---------- NEW: optional metadata filter/sort ----------
                 if spec and results:
-                    results = simple_post_filter(results, spec)
-            except FileNotFoundError as exc:
-                st.error(str(exc))
-                return
-            except Exception as exc:
-                st.error(f"Search failed: {exc}")
-                return
+                    results = metadata_filter_enhanced(results, spec)
+        except Exception as exc:
+            with left_col:
+                with chat_container:
+                    st.error(f"Search failed: {exc}")
+            return
 
-            if apply_rerank and results:
-                start = time.perf_counter()
-                rerank_results: Optional[List[Dict[str, Any]]] = None
-                with st.spinner("Reranking results..."):
+        # Reranking
+        if apply_rerank and results:
+            start = time.perf_counter()
+            with st.spinner("Reranking results..."):
+                try:
+                    rerank_query = hypothesis_text if (use_hypothesis and hypothesis_text) else semantic_text
+                    results = rerank_with_cross_encoder(rerank_query, results, top_k=top_k)
+                except:
+                    st.warning("Cross-encoder rerank failed.")
+                finally:
+                    rerank_elapsed = time.perf_counter() - start
+
+        # LLM summaries
+        if generate_summaries and results:
+            start = time.perf_counter()
+            with st.spinner("Generating LLM summaries..."):
+                for paper in results:
+                    title_for_summary = pick_first_non_empty(
+                        paper.get('title'),
+                        paper.get('paper_title'),
+                        paper.get('name'),
+                        paper.get('content'),
+                    )
+                    if not title_for_summary:
+                        continue
                     try:
-                        rerank_query = hypothesis_text if (use_hypothesis and hypothesis_text) else semantic_text
-                        rerank_results = rerank_with_cross_encoder(rerank_query, results, top_k=top_k)
-                    except Exception as exc:
-                        st.warning(f"Cross-encoder rerank failed: {exc}")
-                        results = results[:top_k]
-                    finally:
-                        rerank_elapsed = time.perf_counter() - start
-                if rerank_results is None:
-                    print("\n\nRerank failed\n\n")
-                    st.info("Rerank failed.")
-                else:
-                    results = rerank_results
+                        summary_text = cached_summarize_title(title_for_summary)
+                    except Exception:
+                        break
+                    if summary_text:
+                        paper["llm_summary"] = summary_text
+                        llm_summaries_generated = True
+            llm_summary_elapsed = time.perf_counter() - start
 
-            if generate_summaries and results:
-                start = time.perf_counter()
-                llm_error: Optional[Exception] = None
-                with st.spinner("Generating LLM summaries..."):
-                    for paper in results:
-                        title_for_summary = pick_first_non_empty(
-                            paper.get('title'),
-                            paper.get('paper_title'),
-                            paper.get('name'),
-                            paper.get('content'),
-                        )
-                        if not title_for_summary:
-                            continue
-                        try:
-                            summary_text = cached_summarize_title(title_for_summary)
-                        except Exception as exc:
-                            llm_error = exc
-                            break
-                        if summary_text:
-                            paper['llm_summary'] = summary_text
-                            llm_summaries_generated = True
-                llm_summary_elapsed = time.perf_counter() - start
-                if llm_error is not None:
-                    st.warning(f"LLM summarization stopped early: {llm_error}")
+        # -------------------------------
+        # LEFT COLUMN: SYSTEM MESSAGE
+        # -------------------------------
+        with left_col:
+            with chat_container:
+                st.markdown(
+                    f"""
+                    <div style='background:#1e1e1e;padding:10px;border-radius:8px;margin-bottom:10px;'>
+                        <b>System:</b> Found {len(results)} result(s)
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
-            if results:
-                if hypothesis_elapsed is not None:
-                    for paper in results:
-                        paper['abstract_generation_seconds'] = hypothesis_elapsed
-                if rerank_elapsed is not None:
-                    for paper in results:
-                        paper['rerank_seconds'] = rerank_elapsed
-
-    if use_hypothesis and submitted:
-        if hypothesis_elapsed is not None:
-            st.metric("Abstract Generation Duration (s)", f"{hypothesis_elapsed:.3f}")
-        if hypothesis_text:
-            st.text_area(
-                "Generated Hypothesis",
-                value=hypothesis_text,
-                height=120,
-                key="generated_hypothesis_display",
-            )
-        else:
-            st.info("No hypothesis was generated; the search used the original query.")
-
-    if apply_rerank and submitted:
-        if rerank_elapsed is not None:
-            st.metric("Rerank Duration (s)", f"{rerank_elapsed:.3f}")
-        else:
-            st.info("Rerank step skipped because no results were available.")
-
-    if generate_summaries and submitted:
-        if llm_summary_elapsed is not None:
-            st.metric("LLM Summary Duration (s)", f"{llm_summary_elapsed:.3f}")
-            if not llm_summaries_generated:
-                st.info("LLM summarization completed but did not return any summaries.")
-        elif results:
-            st.info("LLM summarization skipped because no valid titles were available.")
-        else:
-            st.info("LLM summarization skipped because no results were available.")
-
+    # -------------------------------
+    # RIGHT COLUMN: ONLY SHOW IF RESULTS EXIST
+    # -------------------------------
     if results:
-        st.subheader(f"Top {len(results)} result{'s' if len(results) != 1 else ''}")
-        for rank, paper in enumerate(results, start=1):
-            render_result(rank, paper)
-    if submitted and spec:
-        # Always-visible sidebar view of the analyzer output
-        with st.sidebar:
-            st.markdown("**Query Analyzer Output**")
-            st.json({
-                "intent": spec.intent,
-                "keyword_query": spec.keyword_query,
-                "semantic_query": spec.semantic_query,
-                "metadata_filters": spec.metadata_filters,
-                "qualifiers": spec.qualifiers,
-            })
+        with right_col:
+            st.subheader("Search Results")
+            for rank, paper in enumerate(results, start=1):
+                render_result(rank, paper)
 
-        # Main area expander, opened by default for visibility
-        with st.expander("Query Decomposer Analysis (ASTA-style)", expanded=True):
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("**Keyword Query** (for keyword search)")
-                st.info(spec.keyword_query if spec.keyword_query else "Not extracted")
-            with col2:
-                st.markdown("**Semantic Query** (for vector search)")
-                st.info(spec.semantic_query if spec.semantic_query else "Not extracted")
-            
-            st.markdown("**Full Analysis**")
-            st.json({
-                "intent": spec.intent,
-                "keyword_query": spec.keyword_query,
-                "semantic_query": spec.semantic_query,
-                "metadata_filters": spec.metadata_filters,
-                "qualifiers": spec.qualifiers,
-            })
-
-        st.divider()
-    elif submitted and query_text:
-        st.info("No results found. Try broadening the query or lowering the top_k value.")
-    elif not submitted:
-        st.info("Enter a query and click **Search** to retrieve relevant papers.")
+    elif send and not query_text:
+        with left_col:
+            st.warning("Please enter a query before searching.")
 
 
 if __name__ == "__main__":
     main()
-
-
-
-# def _safe_norm(x: np.ndarray) -> np.ndarray:
-#     x = x.astype("float32", copy=False)
-#     norms = np.linalg.norm(x, axis=1, keepdims=True).clip(min=1e-12)
-#     return np.ascontiguousarray(x / norms)
-
-# @st.cache_resource
-# def load_data_and_index(parquet_path: str, metadata_csv: str):
-#     if not Path(parquet_path).exists():
-#         st.error(f"Parquet not found: {parquet_path}")
-#         st.stop()
-#     df = pd.read_parquet(parquet_path)
-
-#     # Ensure text columns
-#     for col in (TITLE_COL, ABSTR_COL):
-#         if col not in df.columns:
-#             df[col] = ""
-#     for col in (FILEPATH_COL, URL_COL, ARXIV_ID_COL):
-#         if col not in df.columns:
-#             df[col] = ""
-
-#     # Optional metadata enrichment
-#     meta = None
-#     if Path(metadata_csv).exists():
-#         meta = pd.read_csv(metadata_csv)
-#         # Keep only relevant columns if present
-#         keep = ["filepath","filename","arxiv_id","short_id","version","published","updated","doi","title","abstract"]
-#         cols = [c for c in keep if c in meta.columns]
-#         meta = meta[cols].copy()
-
-#         # Prefer merge on filepath if available; else try arxiv_id
-#         if FILEPATH_COL in df.columns and "filepath" in meta.columns:
-#             df = df.merge(meta, how="left", left_on=FILEPATH_COL, right_on="filepath", suffixes=("", "_meta"))
-#         elif ARXIV_ID_COL in df.columns and "arxiv_id" in meta.columns:
-#             df = df.merge(meta, how="left", left_on=ARXIV_ID_COL, right_on="arxiv_id", suffixes=("", "_meta"))
-#         # If title/abstract exist in both, keep primary df versions
-
-#         # Fill missing text fields from metadata if parquet lacked them
-#         if df[TITLE_COL].eq("").any() and "title_meta" in df.columns:
-#             df[TITLE_COL] = df[TITLE_COL].mask(df[TITLE_COL].eq(""), df["title_meta"].fillna(""))
-#         if df[ABSTR_COL].eq("").any() and "abstract_meta" in df.columns:
-#             df[ABSTR_COL] = df[ABSTR_COL].mask(df[ABSTR_COL].eq(""), df["abstract_meta"].fillna(""))
-
-#     # Embeddings
-#     if EMBED_COL not in df.columns:
-#         st.error(f"Parquet must contain an '{EMBED_COL}' column with arrays.")
-#         st.stop()
-#     X = np.vstack(df[EMBED_COL].to_numpy())
-#     X = _safe_norm(X)
-#     index = faiss.IndexFlatIP(X.shape[1])
-#     index.add(X)
-
-#     return df, index
-
-# @st.cache_resource
-# def load_specter2():
-#     tok = AutoTokenizer.from_pretrained(SPECTER2_MODEL, use_fast=True)
-#     model = AutoAdapterModel.from_pretrained(SPECTER2_MODEL)
-#     model.load_adapter(SPECTER2_ADAPTER, source="hf", load_as="specter2")
-#     model.set_active_adapters("specter2")
-#     device = "cuda" if torch.cuda.is_available() else "cpu"
-#     model.to(device).eval()
-#     return tok, model, device
-
-# @torch.inference_mode()
-# def encode_query_specter2(tok, model, device, text: str) -> np.ndarray:
-#     enc = tok(text, truncation=True, max_length=512, return_tensors="pt").to(device)
-#     cls = model(**enc).last_hidden_state[:, 0]
-#     cls = torch.nn.functional.normalize(cls, p=2, dim=-1)
-#     return cls[0].detach().cpu().numpy().astype("float32")[None, :]
-
-# @st.cache_resource
-# def load_reranker():
-#     device = "cuda" if torch.cuda.is_available() else "cpu"
-#     return SentenceTransformer(RERANK_MODEL, device=device)
-
-# def rerank_with_mxbai(query: str, doc_vectors: np.ndarray, rer_model, batch_size: int = 64):
-#     qv = rer_model.encode([query], normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)[0]
-#     scores = doc_vectors @ qv.astype(np.float32)
-#     return scores
-
-# def trim(s: str, n=420):
-#     s = (s or "").replace("\n", " ").strip()
-#     return s if len(s) <= n else s[:n] + "…"
-
-# def link_for_row(row):
-#     url = row.get(URL_COL, "") or ""
-#     if isinstance(url, str) and url:
-#         return url
-#     fp = row.get(FILEPATH_COL, "") or ""
-#     if isinstance(fp, str) and fp:
-#         return f"file://{Path(fp).absolute()}"
-#     return ""
-
-# def fmt_date(s):
-#     if pd.isna(s) or not isinstance(s, str) or not s:
-#         return ""
-#     # s may already be ISO; keep as-is but shorten if needed
-#     return s.split("T")[0] if "T" in s else s
-
-# # ---- LLM explainer ----
-# @st.cache_resource
-# def load_llm():
-#     use_gpu = torch.cuda.is_available()
-#     name = LLM_GPU_MODEL if use_gpu else LLM_CPU_MODEL
-#     tok = AutoTokenizer.from_pretrained(name, use_fast=True)
-#     model = AutoModelForCausalLM.from_pretrained(
-#         name,
-#         torch_dtype=torch.float16 if use_gpu else torch.float32,
-#         device_map="auto" if use_gpu else None
-#     )
-#     model.eval()
-#     return tok, model, name
-
-# def build_prompt(query: str, title: str, abstract: str) -> str:
-#     # Stronger, explicit instructions to the LLM to keep the reply short and to the point.
-#     return (
-#         "You are an expert in NLP research.\n"
-#         "Task: In 2–3 concise sentences, explain WHY the given paper (title + abstract) is relevant to the user query.\n"
-#         "Requirements: mention concrete overlaps (task, method, dataset, or key findings). Do NOT include background, filler, or speculative commentary. Use full sentences and be precise.\n\n"
-#         f"Query: {query}\n\n"
-#         f"Paper Title: {title}\n\n"
-#         f"Paper Abstract: {abstract}\n\n"
-#         "Answer (exactly 2–3 sentences):"
-#     )
-
-# @torch.inference_mode()
-# def _first_n_sentences(text: str, n: int = 3) -> str:
-#     """
-#     Return the first `n` *complete* sentences from the text.
-#     Truncates cleanly at sentence boundaries (., !, ?).
-#     """
-#     if not text:
-#         return ""
-#     text = text.strip().replace("\n", " ")
-#     # Split at sentence enders with punctuation followed by whitespace
-#     parts = re.split(r'(?<=[.!?])\s+', text)
-#     parts = [s.strip() for s in parts if s.strip()]
-#     selected = []
-#     for part in parts:
-#         selected.append(part)
-#         if len(selected) >= n:
-#             break
-#     return " ".join(selected)
-
-# def explain_relevance(tok, model, query: str, title: str, abstract: str, max_new_tokens: int = 80) -> str:
-#     prompt = build_prompt(query, title or "", abstract or "")
-#     inputs = tok(prompt, return_tensors="pt", truncation=True, max_length=2048).to(model.device)
-#     out_ids = model.generate(
-#         **inputs,
-#         max_new_tokens=max_new_tokens,
-#         do_sample=False,
-#         temperature=0.2,
-#         repetition_penalty=1.05,
-#         eos_token_id=tok.eos_token_id,
-#     )
-#     text = tok.decode(out_ids[0], skip_special_tokens=True)
-#     if "Answer" in text:
-#         text = text.split("Answer")[-1].lstrip(":").strip()
-#     # Post-process: prefer 2 sentences, allow up to 3 if the second contains an abbreviation that ends with '.'
-#     cleaned = text.strip()
-#     # If the model repeated the prompt, remove prompt content occurrences (defensive)
-#     if prompt.strip() in cleaned:
-#         cleaned = cleaned.replace(prompt.strip(), "")
-#     # Extract first 2 sentences, but if there are 2 very short sentences (<20 chars), try up to 3.
-#     first2 = _first_n_sentences(cleaned, 3)
-#     # If first2 is short, try 3 sentences to provide slightly more substance
-#     if len(first2) < 20:
-#         first3 = _first_n_sentences(cleaned, 4)
-#         return first3.strip()
-#     return first2.strip()
-
-# -----------------------------
-# UI (with session state patch)
-# -----------------------------
-# st.set_page_config(page_title="Local NLP Paper Search", layout="wide")
-# st.title("🔎 Local NLP Paper Search")
-
-# with st.sidebar:
-#     st.header("Settings")
-#     topk = st.slider("Initial ANN top‑k", 10, 200, TOPK_INITIAL, 10)
-#     showk = st.slider("Show top‑k", 5, 50, TOPK_SHOW, 5)
-#     do_rerank = st.checkbox("Re‑rank with mxbai embeddings", value=True)
-#     gen_llm = st.checkbox("Generate ‘why relevant’ (open‑source LLM)", value=True)
-#     st.caption("Disable re‑ranking and LLM for faster results.")
-
-# query = st.text_input("Query (e.g., “Large language models for automatic speech recognition”):", value="")
-# search = st.button("Search", type="primary", use_container_width=True)
-
-# # Load data and models
-# df, index = load_data_and_index(SPECTER2_PARQUET, METADATA_CSV)
-# tok_s2, model_s2, device_s2 = load_specter2()
-# rer_model = load_reranker() if do_rerank else None
-# tok_llm = model_llm = model_llm_name = None
-# if gen_llm:
-#     tok_llm, model_llm, model_llm_name = load_llm()
-
-# # Load cached doc vectors
-# MXBAI_VECS_PATH = "app/mxbai_doc_vectors.npy"
-# mxbai_vecs = np.load(MXBAI_VECS_PATH, mmap_mode="r").astype(np.float32)
-
-# # Handle query + search
-# if search and query.strip():
-#     with st.spinner("Encoding query with SPECTER2 and searching ANN…"):
-#         q = encode_query_specter2(tok_s2, model_s2, device_s2, query.strip())
-#         D, I = index.search(q, topk)
-
-#     cand = df.iloc[I[0]].copy()
-#     cand["ann_cosine"] = D[0]
-
-#     if do_rerank:
-#         with st.spinner("Re‑ranking with mxbai embeddings…"):
-#             doc_subvecs = mxbai_vecs[I[0]]
-#             r_scores = rerank_with_mxbai(query.strip(), doc_subvecs, rer_model)
-#             cand["rerank_cosine"] = r_scores
-#             cand = cand.sort_values("rerank_cosine", ascending=False)
-#     else:
-#         cand = cand.sort_values("ann_cosine", ascending=False)
-
-#     # Save to session state
-#     st.session_state["last_query"] = query.strip()
-#     st.session_state["last_results"] = cand.reset_index(drop=True)
-
-# # Use saved results if available
-# cur_query = query.strip() or st.session_state.get("last_query", "")
-# cur_results = st.session_state.get("last_results", None)
-
-# if cur_query and cur_results is not None:
-#     st.subheader("Results")
-#     for i, row in cur_results.head(showk).iterrows():
-#         title = row[TITLE_COL] or "(untitled)"
-#         abs_full = row[ABSTR_COL]
-#         ann_s = f"{row['ann_cosine']:.3f}"
-
-#         st.markdown(f"### {i+1}. {title}")
-#         if "rerank_cosine" in row:
-#             st.caption(f"ANN cosine: {ann_s}  |  Re‑rank cosine: {row['rerank_cosine']:.3f}")
-#         else:
-#             st.caption(f"ANN cosine: {ann_s}")
-
-#         if gen_llm and tok_llm is not None:
-#             with st.expander("Why relevant (LLM)", expanded=False):
-#                 key = f"llm_button_{i}"
-#                 if st.button("Generate explanation", key=key):
-#                     with st.spinner("Generating explanation..."):
-#                         try:
-#                             expl = explain_relevance(tok_llm, model_llm, cur_query, title, abs_full)
-#                         except Exception as e:
-#                             expl = f"(LLM explanation failed: {e})"
-#                         st.session_state[f"llm_output_{i}"] = expl
-
-#                 if f"llm_output_{i}" in st.session_state:
-#                     st.write(st.session_state[f"llm_output_{i}"])
-
-
-#         with st.expander("Show details"):
-#             col1, col2 = st.columns(2)
-#             with col1:
-#                 st.markdown("**Abstract**")
-#                 st.write(abs_full if isinstance(abs_full, str) and abs_full else "_(no abstract)_")
-#             with col2:
-#                 pub = fmt_date(row.get("published", ""))
-#                 upd = fmt_date(row.get("updated", ""))
-#                 doi = row.get("doi", "") or row.get("doi_meta", "")
-#                 arx = row.get(ARXIV_ID_COL, "") or row.get("arxiv_id", "")
-#                 fn = row.get("filename", "") or row.get("filename_meta", "")
-#                 st.markdown("**Metadata**")
-#                 st.write(f"- **Published:** {pub or '—'}")
-#                 st.write(f"- **Updated:** {upd or '—'}")
-#                 st.write(f"- **DOI:** {doi or '—'}")
-#                 st.write(f"- **arXiv ID:** {arx or '—'}")
-#                 st.write(f"- **File:** {fn or Path(str(row.get(FILEPATH_COL,''))).name}")
-#                 if arx:
-#                     st.write(f"- **arXiv:** https://arxiv.org/abs/{arx}")
-#                 if doi:
-#                     st.write(f"- **Crossref:** https://doi.org/{doi}")
-
-#         st.divider()
-
-#     with st.expander("Raw table"):
-#         cols = [TITLE_COL, ABSTR_COL, "ann_cosine"] + (["rerank_cosine"] if "rerank_cosine" in cur_results.columns else [])
-#         for extra in ["published", "updated", "doi", ARXIV_ID_COL, FILEPATH_COL]:
-#             if extra in cur_results.columns and extra not in cols:
-#                 cols.append(extra)
-#         st.dataframe(cur_results.head(showk)[cols].reset_index(drop=True))
-# else:
-#     st.info("Enter a query and press **Search** to see results.")
