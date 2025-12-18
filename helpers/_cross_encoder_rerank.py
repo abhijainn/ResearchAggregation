@@ -18,9 +18,7 @@ try:
 except ImportError:
     from config import CONFIG  # type: ignore
 
-
 DEFAULT_MODEL = CONFIG.rerank.cross_encoder_model
-
 
 @lru_cache(maxsize=2)
 def _load_model_and_tokenizer(model_name: str = DEFAULT_MODEL, device: Optional[str] = None):
@@ -31,7 +29,6 @@ def _load_model_and_tokenizer(model_name: str = DEFAULT_MODEL, device: Optional[
     model.to(device)
     model.eval()
     return model, tokenizer, device
-
 
 def _score_batch(model, tokenizer, device, pairs: List[tuple], batch_size: int = 16) -> List[float]:
     scores: List[float] = []
@@ -85,7 +82,6 @@ def _get_full_text_for_candidate(cand):
 
     # fallback
     return cand.get("content") or cand.get("summary") or cand.get("abstract") or title
-
 
 def rerank_with_cross_encoder(
     query: str,

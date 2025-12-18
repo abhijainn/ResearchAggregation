@@ -31,6 +31,7 @@ from helpers._log import *
 from app.decompose import decompose_query
 
 import pandas as pd
+import faiss
 
 # -----------------------------
 # CONFIG — edit paths if needed
@@ -50,95 +51,28 @@ EMBED_MODEL_NAME = CONFIG.vector.embed_model_name
 def get_embedder(model_name: str = EMBED_MODEL_NAME) -> Specter2Embeddings:
     return Specter2Embeddings(model_name=model_name)
 
+_FAISS_INDEX = None
+_FAISS_IDS   = None
+_FAISS_META  = None
 
-@lru_cache(maxsize=1)
-def load_embedding_corpus():
-    """
-    Loads embeddings + IDs from the merged Parquet file instead of .npy/.csv.
 
-    Uses:
-      - specter2_embeddings_all.parquet  (merged batch files)
-      - enhanced_final_meta_dataset_with_arxiv_deduped.csv
+def load_faiss_index_once():
+    global _FAISS_INDEX, _FAISS_IDS, _FAISS_META
 
-    Returns:
-      embeddings: np.ndarray of shape [N, D]
-      merged: pd.DataFrame with enriched metadata aligned to embedding rows
-    """
+    if _FAISS_INDEX is not None:
+        return _FAISS_INDEX, _FAISS_IDS, _FAISS_META
 
-    parquet_path = r"C:\Users\sophi\Documents\research\FDL research\ResearchAggregation\data2\specter2_embeddings_all.parquet"
-    enhanced_path = r"C:\Users\sophi\Documents\research\FDL research\ResearchAggregation\data2\enhanced_final_meta_dataset_with_arxiv_deduped.csv"
+    print("Loading FAISS index + ID + metadata parquet...")
 
-    if not os.path.exists(parquet_path):
-        raise FileNotFoundError(f"Missing merged parquet file: {parquet_path}")
-    if not os.path.exists(enhanced_path):
-        raise FileNotFoundError(f"Missing enhanced metadata CSV: {enhanced_path}")
+    index = faiss.read_index("specter2.faiss")
+    ids   = np.load("specter2_ids.npy", allow_pickle=True).tolist()
+    meta  = pd.read_parquet("specter2_meta.parquet")   # same order
+    print(meta.columns.tolist())
 
-    # ====================================================
-    # 1. Load Parquet (embeddings + IDs)
-    # ====================================================
-    table = pq.read_table(parquet_path)
-
-    # Convert to pandas for easier merging logic
-    df_emb = table.to_pandas()
-
-    # Normalize ID column to string
-    if "source_id_clean" not in df_emb.columns:
-        raise KeyError("Column 'source_id_clean' missing from parquet file")
-
-    df_emb["source_id_clean"] = df_emb["source_id_clean"].astype(str).str.strip()
-
-    # Extract embeddings as a numpy array
-    # Each row is a list<float>, so convert manually
-    embeddings = np.vstack(df_emb["embedding"].apply(lambda x: np.array(x, dtype=np.float32)))
-
-    # ====================================================
-    # 2. Load enhanced metadata
-    # ====================================================
-    enhanced = pd.read_csv(enhanced_path)
-
-    # Normalize ID formats
-    enhanced["source_id_clean"] = enhanced["source_id_clean"].astype(str).str.strip()
-
-    # Debug intersections
-    set_emb = set(df_emb["source_id_clean"])
-    set_enh = set(enhanced["source_id_clean"])
-
-    print("Embedding IDs:", len(set_emb))
-    print("Enhanced IDs:", len(set_enh))
-    print("Intersection:", len(set_emb & set_enh))
-    print("Example overlap:", list(set_emb & set_enh)[:10])
-
-    missing_in_enh = set_emb - set_enh
-    missing_in_emb = set_enh - set_emb
-    print("Missing in enhanced:", len(missing_in_enh))
-    print("Missing in embeddings:", len(missing_in_emb))
-
-    # ====================================================
-    # 3. Merge by source_id_clean
-    # Keeps embedding order because we merge df_emb → enhanced
-    # ====================================================
-    merged = df_emb.merge(
-        enhanced,
-        on="source_id_clean",
-        how="left",
-        suffixes=("", "_enh"),
-    )
-
-    # ====================================================
-    # 4. Fill missing metadata fields
-    # ====================================================
-    def _fill_missing(target_col, source_col):
-        if target_col not in merged.columns or source_col not in merged.columns:
-            return
-        mask = merged[target_col].isna() | merged[target_col].astype(str).str.strip().eq("")
-        merged.loc[mask, target_col] = merged.loc[mask, source_col]
-
-    _fill_missing("paper_title", "paper_title_enh")
-    _fill_missing("authors", "authors_enh")
-
-    # Other enhanced-only fields are already present under their names.
-
-    return embeddings, merged
+    _FAISS_INDEX = index
+    _FAISS_IDS   = ids
+    _FAISS_META  = meta
+    return index, ids, meta
 
 def build_results_from_metadata(df: pd.DataFrame) -> list[dict]:
     results = []
@@ -152,7 +86,7 @@ def build_results_from_metadata(df: pd.DataFrame) -> list[dict]:
             "doi": row.get("doi"),
             "journal": row.get("journal"),
             "date": row.get("date"),
-            "content": row.get("text"),
+            "content": row.get("abstract"),
             "source_id": row.get("source_id_clean"),
             "vector_score": None,
             "row_index": row.get("row_index"),
@@ -164,97 +98,58 @@ def build_results_from_metadata(df: pd.DataFrame) -> list[dict]:
 def semantic_search(
     query: str,
     top_k: int = 5,
-    fetch_k: int | None = None,
     *,
     use_hypothesis: bool = False,
     precomputed_hypothesis: Optional[str] = None,
-    restrict_df: Optional[pd.DataFrame] = None,
-) -> Tuple[List[Dict], Optional[str]]:
-    """
-    Semantic search using:
-      - specter2_embeddings_acl.npy  (NumPy array, shape [N, D])
-      - specter2_id_map_acl.csv      (row_index, source_id, paper_title, authors, text)
-      - enriched metadata from enhanced_final_meta_dataset_with_arxiv_deduped.csv
-    """
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
 
-    # Load embedding matrix + pandas mapping (enriched)
-    embeddings, mapping = load_embedding_corpus()
-
-    if restrict_df is not None:
-        # Keep only rows whose source_id_clean appear in the restricted set
-        restrict_ids = set(str(x).strip() for x in restrict_df["source_id"])
-        mask = mapping["source_id"].astype(str).str.strip().isin(restrict_ids)
-
-        # Filter embeddings and mapping together
-        embeddings = embeddings[mask.values]
-        mapping = mapping[mask.values]
-
+    # load embedding model only once
     embedder = get_embedder()
 
-    fetch = fetch_k or max(top_k, 20)
-    fetch = max(fetch, top_k)
-
-    # ----------------------------------------
-    # Hypothesis generation handling
-    # ----------------------------------------
+    # step 1: handle hypothesis
     search_text = query
-    hypothesis: Optional[str] = None
-    candidate_hypothesis: Optional[str] = precomputed_hypothesis
+    hypothesis = None
+    candidate = precomputed_hypothesis
 
-    if candidate_hypothesis is None and use_hypothesis:
+    if candidate is None and use_hypothesis:
         try:
-            candidate_hypothesis = get_claim(query)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to generate hypothesis: {exc}") from exc
+            candidate = get_claim(query)
+        except Exception:
+            candidate = None
 
-    if isinstance(candidate_hypothesis, str):
-        stripped = candidate_hypothesis.strip()
-        if stripped:
-            search_text = stripped
-            hypothesis = stripped
-        else:
-            hypothesis = None
-    else:
-        hypothesis = None
+    if isinstance(candidate, str) and candidate.strip():
+        search_text = candidate.strip()
+        hypothesis  = candidate.strip()
 
-    # ----------------------------------------
-    # Encode the query using SPECTER2
-    # ----------------------------------------
-    q = embedder.embed_query(search_text)       # shape [D]
-    q = q / (np.linalg.norm(q) + 1e-12)
+    # step 2: encode + normalize the query vector
+    q = embedder.embed_query(search_text)
+    q = np.asarray(q, dtype=np.float32)          # convert list → np array
+    q /= (norm(q) + 1e-12)
+    q = q.reshape(1, -1)
 
-    # Normalize embeddings for cosine similarity
-    E = embeddings
-    E = E / (np.linalg.norm(E, axis=1, keepdims=True) + 1e-12)
+    # === load FAISS, ids, metadata (cached) ===
+    index, ids, meta = load_faiss_index_once()
 
-    # Compute cosine similarity
-    sims = E @ q  # shape [N]
+    # step 3: FAISS similarity lookup
+    #   EXACT: uses inner product since vectors normalized
+    D, I = index.search(q, top_k)
 
-    # Select top fetch candidates
-    idx = np.argpartition(sims, -fetch)[-fetch:]
-    idx = idx[np.argsort(sims[idx])[::-1]]
-    idx = idx[:top_k]
+    # retrieve metadata rows
+    # since meta aligns with index → same numbering
+    result_meta = meta.iloc[I[0]]
 
-    # ----------------------------------------
-    # Build results (enriched) in the SAME general format as before
-    # ----------------------------------------
-    results: List[Dict[str, Any]] = []
-    for i in idx:
-        row = mapping.iloc[i]
-
-        base_entry: Dict[str, Any] = {
-            "paper_title": row.get("paper_title"),
-            "authors": row.get("authors"),
-            "date": row.get("date"),
-            "content": row.get("text") or row.get("abstract"),
-            "source_id": row.get("source_id"),
-            "vector_score": float(sims[i]) if sims is not None else None,
-        }
-
-        results.append(base_entry)
+    results = []
+    for row, score in zip(result_meta.itertuples(), D[0]):
+        results.append({
+            "paper_title": row.paper_title,
+            "authors":     row.authors,
+            "date":        row.date,
+            "content":     row.abstract,
+            "source_id":   row.source_id_clean,
+            "vector_score": float(score),
+        })
 
     return results, hypothesis
-
 
 @st.cache_data(show_spinner=False)
 def cached_summarize_title(title: str) -> Optional[str]:
@@ -518,22 +413,21 @@ def main() -> None:
     st.title("Research Aggregation Search")
     st.caption("Run semantic retrieval over the local arXiv corpus with specter embeddings.")
 
-    # -------------------------------
-    # Two-column layout
-    # -------------------------------
-    left_col, right_col = st.columns([2, 3])
+    # -----------------------------------
+    # SINGLE-COLUMN MAIN CONTAINER
+    # -----------------------------------
+    main_col = st.container()
 
-    # -------------------------------
-    # CHAT WINDOW IN LEFT COLUMN
-    # -------------------------------
-    with left_col:
-        
+    # -----------------------------------
+    # SEARCH + CHAT UI
+    # -----------------------------------
+    with main_col:
+
         st.markdown(
             """
             <style>
             .chat-box {
-                height: 45vh;              /* fixed height */
-                overflow-y: auto;          /* scroll inside */
+                overflow-y: auto;
                 padding-right: 10px;
             }
             </style>
@@ -541,12 +435,10 @@ def main() -> None:
             unsafe_allow_html=True,
         )
 
-        # Chat scroll container
         st.markdown("<div class='chat-box'>", unsafe_allow_html=True)
-        chat_container = st.container()    # <-- this is the same container you use later
+        chat_container = st.container()
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # Input box (static)
         with st.form("chat_input_form", clear_on_submit=True):
             user_query = st.text_area(
                 "",
@@ -556,9 +448,9 @@ def main() -> None:
             )
             send = st.form_submit_button("Send")
 
-    # -------------------------------
-    # SIDEBAR SETTINGS
-    # -------------------------------
+    # -----------------------------------
+    # SIDEBAR SETTINGS (unchanged)
+    # -----------------------------------
     with st.sidebar:
         st.header("Search Options")
 
@@ -570,14 +462,15 @@ def main() -> None:
             value=top_k_default if top_k_default >= 1 else 5,
             step=1,
         )
+
         use_hypothesis = st.checkbox("Search with hypothesis", value=False)
         apply_rerank = st.checkbox("Enable cross-encoder reranking", value=False)
         generate_summaries = st.checkbox("Generate LLM summaries", value=False)
         use_llm_analyzer = st.checkbox("Use LLM query analyzer", value=True)
 
-    # -------------------------------
+    # -----------------------------------
     # STATE
-    # -------------------------------
+    # -----------------------------------
     results = []
     hypothesis_text = None
     hypothesis_elapsed = None
@@ -587,27 +480,24 @@ def main() -> None:
 
     query_text = user_query.strip()
 
-    # -------------------------------
-    # HANDLE SEND
-    # -------------------------------
+    # -----------------------------------
+    # ON SEND
+    # -----------------------------------
     if send and query_text:
 
-        # ----------------------------------------
-        # (NEW) Metadata-Aware Decomposition
-        # ----------------------------------------
         fields, metadata_matches = decompose_query(query_text)
 
         only_metadata = (
             metadata_matches is not None
             and len(metadata_matches) > 0
-            and not fields.content.content  # empty content = pure metadata query
+            and not fields.content.content
         )
 
+        # PURE METADATA MATCHES
         if only_metadata:
-            # Fast-path: Return metadata matches (NO semantic search)
             results = build_results_from_metadata(metadata_matches)
 
-            with left_col:
+            with main_col:
                 with chat_container:
                     st.markdown(
                         f"""
@@ -618,15 +508,13 @@ def main() -> None:
                         unsafe_allow_html=True,
                     )
 
-            with right_col:
                 st.subheader("Search Results (Metadata Match)")
                 for rank, paper in enumerate(results, start=1):
                     render_result(rank, paper)
 
-            return  # STOP HERE
+            return
 
-
-        with left_col:
+        with main_col:
             with chat_container:
                 st.markdown(
                     f"""
@@ -637,16 +525,13 @@ def main() -> None:
                     unsafe_allow_html=True,
                 )
 
-        # -------------------------------
-        # ANALYZER, SEARCH, RERANK, SUMMARIES
-        # -------------------------------
         fetch_k = max(top_k * 2, 20)
         hypothesis_generation_failed = False
         spec = None
         semantic_text = query_text
         keyword_text = query_text
 
-        # Analyzer
+        # ANALYZER
         try:
             spec = analyze_query_llm(query_text)
             if spec and spec.semantic_query:
@@ -656,7 +541,7 @@ def main() -> None:
         except:
             pass
 
-        # Hypothesis
+        # HYPOTHESIS
         if use_hypothesis:
             start = time.perf_counter()
             with st.spinner("Generating hypothesis..."):
@@ -665,49 +550,60 @@ def main() -> None:
                 except Exception:
                     hypothesis_text = None
                     hypothesis_generation_failed = True
-                finally:
-                    hypothesis_elapsed = time.perf_counter() - start
+            hypothesis_elapsed = time.perf_counter() - start
+            print(f"[TIMING] hypothesis generation: {hypothesis_elapsed:.4f} sec")
 
-        # Search
+        # SEARCH
         try:
+            start = time.perf_counter()
             with st.spinner("Searching the corpus..."):
                 results, hypothesis_text = semantic_search(
                     semantic_text,
                     top_k=top_k,
-                    fetch_k=fetch_k,
                     use_hypothesis=use_hypothesis and not hypothesis_generation_failed,
                     precomputed_hypothesis=hypothesis_text,
                 )
                 if spec and results:
                     results = metadata_filter_enhanced(results, spec)
+
+            search_elapsed = time.perf_counter() - start
+            print(f"[TIMING] metadata_filter_enhanced(): {search_elapsed:.4f} sec")
         except Exception as exc:
-            with left_col:
+            with main_col:
                 with chat_container:
                     st.error(f"Search failed: {exc}")
             return
 
-        # Reranking
+        # RERANK
         if apply_rerank and results:
             start = time.perf_counter()
             with st.spinner("Reranking results..."):
                 try:
-                    rerank_query = hypothesis_text if (use_hypothesis and hypothesis_text) else semantic_text
-                    results = rerank_with_cross_encoder(rerank_query, results, top_k=top_k)
+                    rerank_query = (
+                        hypothesis_text if (use_hypothesis and hypothesis_text) else semantic_text
+                    )
+                    new_results = rerank_with_cross_encoder(
+                        rerank_query,
+                        results,
+                        top_k=top_k,
+                    )
+                    if new_results is not None:
+                        results = new_results
                 except:
                     st.warning("Cross-encoder rerank failed.")
                 finally:
                     rerank_elapsed = time.perf_counter() - start
 
-        # LLM summaries
+        # LLM SUMMARIES
         if generate_summaries and results:
             start = time.perf_counter()
             with st.spinner("Generating LLM summaries..."):
                 for paper in results:
                     title_for_summary = pick_first_non_empty(
-                        paper.get('title'),
-                        paper.get('paper_title'),
-                        paper.get('name'),
-                        paper.get('content'),
+                        paper.get("title"),
+                        paper.get("paper_title"),
+                        paper.get("name"),
+                        paper.get("content"),
                     )
                     if not title_for_summary:
                         continue
@@ -720,10 +616,8 @@ def main() -> None:
                         llm_summaries_generated = True
             llm_summary_elapsed = time.perf_counter() - start
 
-        # -------------------------------
-        # LEFT COLUMN: SYSTEM MESSAGE
-        # -------------------------------
-        with left_col:
+        # FINAL USER MESSAGE IN CHAT WINDOW
+        with main_col:
             with chat_container:
                 st.markdown(
                     f"""
@@ -734,17 +628,17 @@ def main() -> None:
                     unsafe_allow_html=True,
                 )
 
-    # -------------------------------
-    # RIGHT COLUMN: ONLY SHOW IF RESULTS EXIST
-    # -------------------------------
+    # -----------------------------------
+    # RESULTS RENDER BELOW SEARCH BOX
+    # -----------------------------------
     if results:
-        with right_col:
+        with main_col:
             st.subheader("Search Results")
             for rank, paper in enumerate(results, start=1):
                 render_result(rank, paper)
 
     elif send and not query_text:
-        with left_col:
+        with main_col:
             st.warning("Please enter a query before searching.")
 
 
